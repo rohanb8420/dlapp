@@ -1,48 +1,73 @@
+"""Utility for ingesting document metadata from an Excel training file into SQLite.
 
-import os
-import io
-import re
+The script reads a spreadsheet (default: trainingdata.xlsx) containing
+`filepath` and `businesscapability` columns, extracts light-weight metadata and
+optionally textual content for each listed file, and persists the information in
+`artifacts/dlm_reader.db`. A Streamlit UI is provided to explore the stored
+records.
+"""
+
+import argparse
 import csv
-import zipfile
 import hashlib
-import sqlite3
+import logging
 import mimetypes
+import shutil
+import sqlite3
+import subprocess
+
+import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
-# Optional imports (soft dependencies)
+try:  # Optional UI dependency
+    import streamlit as st
+except Exception:  # pragma: no cover - environments without Streamlit support
+    st = None
+
+# Optional libraries for richer content extraction. The script falls back to
+# empty strings when these packages are unavailable.
 try:
     from docx import Document as DocxDocument
-except Exception:
+except Exception:  # pragma: no cover
     DocxDocument = None
 
 try:
     from pptx import Presentation as PptxPresentation
-except Exception:
+except Exception:  # pragma: no cover
     PptxPresentation = None
 
 try:
     import openpyxl
-except Exception:
+except Exception:  # pragma: no cover
     openpyxl = None
 
 try:
     from PyPDF2 import PdfReader
-except Exception:
+except Exception:  # pragma: no cover
     PdfReader = None
 
-# Tika is optional; requires Java and first-run download
-try:
+try:  # Apache Tika (optional, requires Java) for hard-to-parse formats
     from tika import parser as tika_parser
-except Exception:
+except Exception:  # pragma: no cover
     tika_parser = None
 
-DB_PATH_DEFAULT = os.path.join("artifacts", "dlm_reader.db")
-MAX_TEXT = 100_000  # limit stored text per file for demo
+LOGGER = logging.getLogger(__name__)
+MAX_TEXT = 100_000
+DB_PATH_DEFAULT = Path("artifacts") / "dlm_reader.db"
+
+FILEPATH_COLUMN = "filepath"
+FILEPATH_ALIASES: Sequence[str] = ("file_location", "file_path", "path")
+CATEGORY_COLUMN = "businesscapability"
+CATEGORY_ALIASES: Sequence[str] = (
+    "business_category",
+    "businessCategory",
+    "BusinessCapability",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
@@ -62,10 +87,11 @@ CREATE TABLE IF NOT EXISTS files(
 CREATE TABLE IF NOT EXISTS labels(
   file_id INTEGER,
   business_category TEXT,
+  UNIQUE(file_id, business_category),
   FOREIGN KEY(file_id) REFERENCES files(file_id)
 );
 CREATE TABLE IF NOT EXISTS content(
-  file_id INTEGER,
+  file_id INTEGER PRIMARY KEY,
   content_text TEXT,
   FOREIGN KEY(file_id) REFERENCES files(file_id)
 );
@@ -73,31 +99,34 @@ CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 CREATE INDEX IF NOT EXISTS idx_labels_file ON labels(file_id);
 """
 
-def ensure_db(db_path: str):
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    con = sqlite3.connect(db_path)
+
+def ensure_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
     with con:
         con.executescript(SCHEMA)
     con.close()
 
-def sha1_of_file(path: str) -> Optional[str]:
+
+def sha1_of_file(path: Path) -> Optional[str]:
     try:
         h = hashlib.sha1()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8192), b""):
                 h.update(chunk)
         return h.hexdigest()
     except Exception:
         return None
 
-def stat_path(path: str) -> Dict[str, Any]:
-    p = Path(path)
+
+def stat_path(path_str: str) -> Dict[str, Any]:
+    path = Path(path_str)
     info = {
-        "path": str(p),
-        "folder": str(p.parent),
-        "file_name": p.name,
-        "extension": p.suffix.lower().lstrip("."),
-        "mime_type": mimetypes.guess_type(str(p))[0] or "",
+        "path": str(path),
+        "folder": str(path.parent),
+        "file_name": path.name,
+        "extension": path.suffix.lower().lstrip("."),
+        "mime_type": mimetypes.guess_type(str(path))[0] or "",
         "size_bytes": None,
         "created_ts": None,
         "modified_ts": None,
@@ -106,243 +135,571 @@ def stat_path(path: str) -> Dict[str, Any]:
         "read_error": None,
     }
     try:
-        st = p.stat()
-        info.update({
-            "size_bytes": int(st.st_size),
-            "created_ts": datetime.fromtimestamp(st.st_ctime).isoformat(),
-            "modified_ts": datetime.fromtimestamp(st.st_mtime).isoformat(),
-            "sha1": sha1_of_file(str(p)),
-            "exists_flag": 1
-        })
-    except Exception as e:
-        info["read_error"] = f"stat_error: {e}"
+        stats = path.stat()
+        info.update(
+            {
+                "size_bytes": int(stats.st_size),
+                "created_ts": datetime.fromtimestamp(stats.st_ctime).isoformat(),
+                "modified_ts": datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                "sha1": sha1_of_file(path),
+                "exists_flag": 1,
+            }
+        )
+    except Exception as exc:
+        info["read_error"] = f"stat_error: {exc}"
     return info
 
-def _read_txt(path: str) -> str:
+
+def _read_txt(path: Path) -> str:
     try:
-        with open(path, "r", errors="ignore") as f:
-            return f.read()
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            text = handle.read(MAX_TEXT)
+            return text[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_csv(path: str) -> str:
+
+def _read_csv(path: Path) -> str:
     try:
-        out = []
-        with open(path, newline="", errors="ignore") as f:
-            for i, row in enumerate(csv.reader(f)):
-                out.append(",".join(row))
-                if len("".join(out)) > MAX_TEXT:
+        rows: List[str] = []
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                rows.append(", ".join(cell.strip() for cell in row if cell))
+                if len("\n".join(rows)) > MAX_TEXT:
                     break
-        return "\n".join(out)
+        return "\n".join(rows)[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_pdf(path: str) -> str:
+
+def _read_pdf(path: Path) -> str:
     if PdfReader is None:
         return ""
     try:
-        reader = PdfReader(path)
-        texts = []
-        for i, page in enumerate(reader.pages):
-            if len("".join(texts)) > MAX_TEXT:
+        reader = PdfReader(str(path))
+        parts: List[str] = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if text:
+                parts.append(text)
+            if len("\n".join(parts)) > MAX_TEXT:
                 break
-            txt = page.extract_text() or ""
-            texts.append(txt)
-        return "\n".join(texts)
+        return "\n".join(parts)[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_docx(path: str) -> str:
+
+def _read_docx(path: Path) -> str:
     if DocxDocument is None:
         return ""
     try:
-        doc = DocxDocument(path)
-        paras = [p.text for p in doc.paragraphs if p.text]
-        return "\n".join(paras)[:MAX_TEXT]
+        document = DocxDocument(str(path))
+        parts = [para.text for para in document.paragraphs if para.text]
+        return "\n".join(parts)[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_pptx(path: str) -> str:
+
+def _read_pptx(path: Path) -> str:
     if PptxPresentation is None:
         return ""
     try:
-        prs = PptxPresentation(path)
-        texts = []
-        for slide in prs.slides:
+        presentation = PptxPresentation(str(path))
+        pieces: List[str] = []
+        for slide in presentation.slides:
             for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    texts.append(shape.text)
-            if len("".join(texts)) > MAX_TEXT:
+                if hasattr(shape, "text") and shape.text:
+                    pieces.append(shape.text)
+            if len("\n".join(pieces)) > MAX_TEXT:
                 break
-        return "\n".join(texts)[:MAX_TEXT]
+        return "\n".join(pieces)[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_xlsx(path: str) -> str:
+
+def _read_xlsx(path: Path) -> str:
     if openpyxl is None:
         return ""
     try:
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        texts = []
-        for ws in wb.worksheets[:3]:
-            for row in ws.iter_rows(min_row=1, max_row=200, values_only=True):
-                vals = [str(v) for v in row if v is not None]
-                if vals:
-                    texts.append(" ".join(vals))
-                if len("".join(texts)) > MAX_TEXT:
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        text_rows: List[str] = []
+        for sheet in wb.worksheets:
+            for row in sheet.iter_rows(values_only=True):
+                row_vals = [str(cell) for cell in row if cell is not None]
+                if row_vals:
+                    text_rows.append(" ".join(row_vals))
+                if len("\n".join(text_rows)) > MAX_TEXT:
                     break
-        return "\n".join(texts)[:MAX_TEXT]
+            if len("\n".join(text_rows)) > MAX_TEXT:
+                break
+        return "\n".join(text_rows)[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_twb(path: str) -> str:
-    # Tableau .twb is XML; extract titles, captions, calc names
+
+def _read_twb(path: Path) -> str:
     try:
-        tree = ET.parse(path)
+        tree = ET.parse(str(path))
         root = tree.getroot()
-        texts = []
+        texts: List[str] = []
         for elem in root.iter():
-            for attr in ["name", "caption", "label", "value"]:
-                v = elem.attrib.get(attr)
-                if v:
-                    texts.append(v)
             if elem.text and elem.text.strip():
                 texts.append(elem.text.strip())
-            if len("".join(texts)) > MAX_TEXT:
+            for attr in ("name", "caption", "label", "value"):
+                value = elem.attrib.get(attr)
+                if value:
+                    texts.append(value)
+            if len("\n".join(texts)) > MAX_TEXT:
                 break
         return "\n".join(texts)[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_twbx(path: str) -> str:
-    # Zip containing a .twb and possibly data extracts; read the .twb
+
+def _read_twbx(path: Path) -> str:
     try:
-        with zipfile.ZipFile(path, "r") as z:
-            twb_members = [m for m in z.namelist() if m.lower().endswith(".twb")]
-            texts = []
-            for m in twb_members:
-                with z.open(m) as f:
-                    try:
-                        xml = f.read()
-                        root = ET.fromstring(xml)
-                        for elem in root.iter():
-                            for attr in ["name", "caption", "label", "value"]:
-                                v = elem.attrib.get(attr)
-                                if v:
-                                    texts.append(v)
-                            if elem.text and elem.text.strip():
-                                texts.append(elem.text.strip())
-                            if len("".join(texts)) > MAX_TEXT:
-                                break
-                    except Exception:
-                        continue
+        with zipfile.ZipFile(str(path)) as archive:
+            members = [m for m in archive.namelist() if m.endswith(".twb")]
+            if not members:
+                return ""
+            texts: List[str] = []
+            with archive.open(members[0]) as handle:
+                data = handle.read()
+            root = ET.fromstring(data)
+            for elem in root.iter():
+                if elem.text and elem.text.strip():
+                    texts.append(elem.text.strip())
+                for attr in ("name", "caption", "label", "value"):
+                    value = elem.attrib.get(attr)
+                    if value:
+                        texts.append(value)
+                if len("\n".join(texts)) > MAX_TEXT:
+                    break
             return "\n".join(texts)[:MAX_TEXT]
     except Exception:
         return ""
 
-def _read_with_tika(path: str) -> str:
+
+def _read_with_tika(path: Path) -> str:
     if tika_parser is None:
         return ""
     try:
-        parsed = tika_parser.from_file(path)
-        content = parsed.get("content") or ""
-        return content[:MAX_TEXT]
+        parsed = tika_parser.from_file(str(path))
+        return (parsed.get("content") or "")[:MAX_TEXT]
     except Exception:
         return ""
 
-def extract_text(path: str, extension: str) -> str:
+
+def extract_text(path: Path, extension: str) -> str:
     ext = extension.lower()
-    if ext in ("txt", "log", "md"):
+    if ext in {"txt", "log", "md"}:
         return _read_txt(path)
-    if ext in ("csv",):
+    if ext in {"csv"}:
         return _read_csv(path)
-    if ext in ("pdf",):
-        t = _read_pdf(path)
-        return t if t else _read_with_tika(path)
-    if ext in ("docx",):
-        t = _read_docx(path)
-        return t if t else _read_with_tika(path)
-    if ext in ("pptx",):
-        t = _read_pptx(path)
-        return t if t else _read_with_tika(path)
-    if ext in ("xlsx", "xlsm"):
-        t = _read_xlsx(path)
-        return t if t else _read_with_tika(path)
-    if ext in ("twb",):
+    if ext == "pdf":
+        text = _read_pdf(path)
+        return text or _read_with_tika(path)
+    if ext == "docx":
+        text = _read_docx(path)
+        return text or _read_with_tika(path)
+    if ext == "pptx":
+        text = _read_pptx(path)
+        return text or _read_with_tika(path)
+    if ext in {"xlsx", "xlsm"}:
+        text = _read_xlsx(path)
+        return text or _read_with_tika(path)
+    if ext == "twb":
         return _read_twb(path)
-    if ext in ("twbx",):
+    if ext == "twbx":
         return _read_twbx(path)
-    if ext in ("one", "ppt", "doc", "xls", "msg"):
-        # legacy / complex -> try Tika
+    if ext in {"one", "ppt", "doc", "xls", "msg"}:
         return _read_with_tika(path)
-    # default: try Tika; else empty
     return _read_with_tika(path)
 
-def upsert_file(con, meta: dict) -> int:
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO files(path, folder, file_name, extension, mime_type, size_bytes, created_ts, modified_ts, sha1, exists_flag, read_error)
-        VALUES (:path, :folder, :file_name, :extension, :mime_type, :size_bytes, :created_ts, :modified_ts, :sha1, :exists_flag, :read_error)
-        ON CONFLICT(path) DO UPDATE SET
-           folder=excluded.folder,
-           file_name=excluded.file_name,
-           extension=excluded.extension,
-           mime_type=excluded.mime_type,
-           size_bytes=excluded.size_bytes,
-           created_ts=excluded.created_ts,
-           modified_ts=excluded.modified_ts,
-           sha1=excluded.sha1,
-           exists_flag=excluded.exists_flag,
-           read_error=excluded.read_error
-    """, meta)
-    con.commit()
-    cur.execute("SELECT file_id FROM files WHERE path=?", (meta["path"],))
-    return int(cur.fetchone()[0])
 
-def upsert_label(con, file_id: int, business_category: str):
-    con.execute("""
-        INSERT INTO labels(file_id, business_category) VALUES (?,?)
-    """, (file_id, business_category))
-    con.commit()
+def upsert_file(con: sqlite3.Connection, meta: Dict[str, Any]) -> int:
+    with con:
+        con.execute(
+            """
+            INSERT INTO files(path, folder, file_name, extension, mime_type, size_bytes,
+                              created_ts, modified_ts, sha1, exists_flag, read_error)
+            VALUES (:path, :folder, :file_name, :extension, :mime_type, :size_bytes,
+                    :created_ts, :modified_ts, :sha1, :exists_flag, :read_error)
+            ON CONFLICT(path) DO UPDATE SET
+                folder=excluded.folder,
+                file_name=excluded.file_name,
+                extension=excluded.extension,
+                mime_type=excluded.mime_type,
+                size_bytes=excluded.size_bytes,
+                created_ts=excluded.created_ts,
+                modified_ts=excluded.modified_ts,
+                sha1=excluded.sha1,
+                exists_flag=excluded.exists_flag,
+                read_error=excluded.read_error
+            """,
+            meta,
+        )
+        cursor = con.execute("SELECT file_id FROM files WHERE path = ?", (meta["path"],))
+        row = cursor.fetchone()
+        if not row:
+            raise RuntimeError(f"Failed to retrieve file_id for {meta['path']}")
+        return int(row[0])
 
-def upsert_content(con, file_id: int, text: str):
-    con.execute("""
-        INSERT INTO content(file_id, content_text) VALUES (?,?)
-    """, (file_id, text))
-    con.commit()
 
-def ingest_from_excel(excel_path: str, db_path: str, limit: int = None):
+def replace_label(con: sqlite3.Connection, file_id: int, label: str) -> None:
+    with con:
+        con.execute("DELETE FROM labels WHERE file_id = ?", (file_id,))
+        if label:
+            con.execute(
+                "INSERT OR IGNORE INTO labels(file_id, business_category) VALUES (?, ?)",
+                (file_id, label),
+            )
+
+
+def replace_content(con: sqlite3.Connection, file_id: int, text: str) -> None:
+    with con:
+        con.execute("DELETE FROM content WHERE file_id = ?", (file_id,))
+        con.execute(
+            "INSERT INTO content(file_id, content_text) VALUES (?, ?)",
+            (file_id, text),
+        )
+
+
+def _resolve_column(df: pd.DataFrame, canonical: str, aliases: Sequence[str]) -> str:
+    if canonical in df.columns:
+        return canonical
+    for name in aliases:
+        if name in df.columns:
+            return name
+    raise KeyError(
+        f"Could not find required column '{canonical}'. Tried aliases: {aliases}. "
+        f"Available columns: {list(df.columns)}"
+    )
+
+
+def ingest_from_excel(
+    excel_path: Path,
+    db_path: Path,
+    limit: Optional[int] = None,
+) -> Dict[str, int]:
     ensure_db(db_path)
     df = pd.read_excel(excel_path)
-    assert {"file_location", "business_category"}.issubset(df.columns), "Excel must have file_location, business_category"
-    if limit:
+    filepath_col = _resolve_column(df, FILEPATH_COLUMN, FILEPATH_ALIASES)
+    category_col = _resolve_column(df, CATEGORY_COLUMN, CATEGORY_ALIASES)
+    if limit is not None:
         df = df.head(limit)
-    con = sqlite3.connect(db_path)
-    inserted = 0
-    errors = 0
-    empty_text = 0
-    for row in df.itertuples():
-        path = str(row.file_location)
-        meta = stat_path(path)
-        try:
-            file_id = upsert_file(con, meta)
-            upsert_label(con, file_id, str(row.business_category))
-            txt = ""
-            if meta["exists_flag"]:
-                txt = extract_text(path, meta["extension"] or "")
-            if not txt:
-                empty_text += 1
-            upsert_content(con, file_id, txt)
-            inserted += 1
-        except Exception as e:
-            errors += 1
-    con.close()
-    return {"inserted": inserted, "errors": errors, "empty_text": empty_text}
+    con = sqlite3.connect(str(db_path))
+    stats = {"inserted": 0, "errors": 0, "empty_text": 0, "skipped_missing": 0}
+    try:
+        rows = df[[filepath_col, category_col]].itertuples(index=False, name=None)
+        for filepath_value, category_value in rows:
+            if filepath_value is None or str(filepath_value).strip() == "":
+                stats["skipped_missing"] += 1
+                continue
+            path_str = str(filepath_value)
+            meta = stat_path(path_str)
+            try:
+                file_id = upsert_file(con, meta)
+                replace_label(
+                    con,
+                    file_id,
+                    str(category_value) if category_value is not None else "",
+                )
+                text = ""
+                if meta["exists_flag"]:
+                    text = extract_text(Path(path_str), meta["extension"] or "")
+                if not text:
+                    stats["empty_text"] += 1
+                replace_content(con, file_id, text)
+                stats["inserted"] += 1
+            except Exception as exc:
+                LOGGER.exception("Failed to ingest %s", path_str)
+                stats["errors"] += 1
+    finally:
+        con.close()
+    return stats
 
-def peek_db(db_path: str, head: int = 50):
-    con = sqlite3.connect(db_path)
-    df_files = pd.read_sql_query("SELECT * FROM files LIMIT ?", con, params=(head,))
-    df_labels = pd.read_sql_query("SELECT * FROM labels LIMIT ?", con, params=(head,))
-    df_content = pd.read_sql_query("SELECT file_id, substr(content_text,1,300) AS content_text FROM content LIMIT 5", con)
+
+def fetch_summary_rows(db_path: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    query = """
+        SELECT f.file_id,
+               f.file_name,
+               f.folder,
+               f.extension,
+               f.mime_type,
+               COALESCE(l.business_category, '') AS business_category,
+               f.exists_flag,
+               f.modified_ts,
+               f.size_bytes
+        FROM files f
+        LEFT JOIN labels l ON l.file_id = f.file_id
+        ORDER BY f.file_id
+    """
+    params: Iterable[Any] = ()
+    if limit is not None:
+        query += " LIMIT ?"
+        params = (limit,)
+    rows = [dict(row) for row in con.execute(query, params).fetchall()]
     con.close()
-    return df_files, df_labels, df_content
+    return rows
+
+
+def fetch_file_detail(db_path: Path, file_id: int) -> Optional[Dict[str, Any]]:
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        file_row = con.execute("SELECT * FROM files WHERE file_id = ?", (file_id,)).fetchone()
+        if not file_row:
+            return None
+        labels = [row[0] for row in con.execute(
+            "SELECT business_category FROM labels WHERE file_id = ?", (file_id,)
+        ).fetchall()]
+        content_row = con.execute(
+            "SELECT content_text FROM content WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        return {
+            "file": dict(file_row),
+            "labels": labels,
+            "content": content_row[0] if content_row else "",
+        }
+    finally:
+        con.close()
+
+
+def is_streamlit_runtime() -> bool:
+    if st is None:
+        return False
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:  # pragma: no cover
+        return False
+    return get_script_run_ctx() is not None
+
+
+def run_streamlit_app(db_path: Path, default_excel: Path) -> None:
+    if st is None:
+        raise RuntimeError("Streamlit is not installed in this environment.")
+
+    st.set_page_config(page_title="Document Metadata Browser", layout="wide")
+    st.title("Document Metadata Browser")
+
+    if "last_ingest_stats" not in st.session_state:
+        st.session_state["last_ingest_stats"] = None
+    if "last_ingest_excel" not in st.session_state:
+        st.session_state["last_ingest_excel"] = str(default_excel)
+
+    with st.sidebar:
+        st.header("Ingestion")
+        excel_input = st.text_input("Excel file", st.session_state["last_ingest_excel"])
+        limit_value = st.number_input(
+            "Row limit (0 = all)", min_value=0, step=1, value=0, format="%d"
+        )
+        run_ingest = st.button("Run ingestion")
+        if run_ingest:
+            excel_path = Path(excel_input)
+            if not excel_path.exists():
+                st.error(f"Excel file not found: {excel_path}")
+            else:
+                limit = limit_value if limit_value > 0 else None
+                with st.spinner("Ingesting files..."):
+                    stats = ingest_from_excel(excel_path, db_path, limit=limit)
+                st.session_state["last_ingest_stats"] = stats
+                st.session_state["last_ingest_excel"] = excel_input
+                st.success(
+                    f"Ingested {stats['inserted']} rows | "
+                    f"skipped_missing={stats['skipped_missing']} empty_text={stats['empty_text']} errors={stats['errors']}"
+                )
+
+        st.markdown("---")
+        st.subheader("Database")
+        st.write(f"Database path: `{db_path}`")
+
+    stats = st.session_state.get("last_ingest_stats")
+    if stats:
+        st.toast(
+            f"Last ingest: inserted={stats['inserted']} | skipped_missing={stats['skipped_missing']} | "
+            f"empty_text={stats['empty_text']} | errors={stats['errors']}",
+            icon="?" if stats.get("errors", 0) == 0 else "??",
+        )
+
+    rows = fetch_summary_rows(db_path)
+    if not rows:
+        st.info("No files in the database yet. Run an ingestion to populate the table.")
+        return
+
+    df_summary = pd.DataFrame(rows)
+    st.subheader("Files")
+    st.dataframe(
+        df_summary,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    file_ids = df_summary["file_id"].tolist()
+    default_file = file_ids[0] if file_ids else None
+    selected_id = st.selectbox(
+        "Select file", file_ids, index=0 if default_file is not None else None
+    )
+
+    if selected_id is None:
+        st.warning("Select a file to view its metadata.")
+        return
+
+    detail = fetch_file_detail(db_path, int(selected_id))
+    if not detail:
+        st.warning("No details found for the selected file.")
+        return
+
+    file_meta = detail["file"]
+    st.subheader("Metadata")
+    st.json(file_meta)
+
+    labels = detail["labels"] or ["(unlabeled)"]
+    st.markdown("**Business Capability:** " + ", ".join(labels))
+
+    content_preview = detail["content"][:2_000]
+    st.subheader("Content Preview")
+    st.text_area(
+        "Extracted text (first 2,000 characters)",
+        value=content_preview or "(no text extracted)",
+        height=300,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ingest document metadata and optionally launch a Streamlit browser UI."
+    )
+    parser.add_argument(
+        "--excel",
+        default="trainingdata.xlsx",
+        type=Path,
+        help="Path to the Excel spreadsheet containing filepath/businesscapability columns.",
+    )
+    parser.add_argument(
+        "--db",
+        default=str(DB_PATH_DEFAULT),
+        type=Path,
+        help="Destination SQLite database path.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional limit on the number of rows to ingest from Excel.",
+    )
+    parser.add_argument(
+        "--skip-ingest",
+        action="store_true",
+        help="Skip ingestion and only open the browser UI.",
+    )
+    parser.add_argument(
+        "--no-ui",
+        action="store_true",
+        help="Run ingestion only and do not launch the UI.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        help="Logging verbosity for the script.",
+    )
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        LOGGER.debug("Ignoring unknown arguments: %s", unknown)
+    return args
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    configure_logging(args.log_level)
+
+    db_path = Path(args.db)
+    ensure_db(db_path)
+
+    running_in_streamlit = is_streamlit_runtime()
+    ingest_stats = None
+
+    if not args.skip_ingest:
+        excel_path = Path(args.excel)
+        if running_in_streamlit and st is not None:
+            if "initial_ingest_done" not in st.session_state:
+                if excel_path.exists():
+                    ingest_stats = ingest_from_excel(
+                        excel_path, db_path, limit=args.limit
+                    )
+                    st.session_state["initial_ingest_stats"] = ingest_stats
+                else:
+                    LOGGER.warning("Excel file not found: %s", excel_path)
+                st.session_state["initial_ingest_done"] = True
+        else:
+            if excel_path.exists():
+                ingest_stats = ingest_from_excel(excel_path, db_path, limit=args.limit)
+                LOGGER.info(
+                    "Ingest complete | inserted=%s skipped_missing=%s empty_text=%s errors=%s",
+                    ingest_stats["inserted"],
+                    ingest_stats["skipped_missing"],
+                    ingest_stats["empty_text"],
+                    ingest_stats["errors"],
+                )
+            else:
+                LOGGER.warning("Excel file not found: %s", excel_path)
+    else:
+        LOGGER.info("Skipping ingestion step as requested.")
+
+    if args.no_ui:
+        return
+
+    if running_in_streamlit:
+        run_streamlit_app(db_path, Path(args.excel))
+        return
+
+    if st is None:
+        LOGGER.error(
+            "Streamlit is not installed. Install it via `pip install streamlit` or re-run with --no-ui."
+        )
+        return
+
+    streamlit_cli = shutil.which("streamlit")
+    if not streamlit_cli:
+        LOGGER.error(
+            "Streamlit CLI not found in PATH. Install Streamlit or adjust your PATH environment."
+        )
+        return
+
+    cmd = [
+        streamlit_cli,
+        "run",
+        str(Path(__file__).resolve()),
+        "--",
+        "--excel",
+        str(Path(args.excel).resolve()),
+        "--db",
+        str(db_path.resolve()),
+    ]
+    if args.limit is not None:
+        cmd.extend(["--limit", str(args.limit)])
+    if args.skip_ingest:
+        cmd.append("--skip-ingest")
+    if args.log_level:
+        cmd.extend(["--log-level", args.log_level])
+
+    LOGGER.info("Launching Streamlit app...")
+    subprocess.run(cmd, check=False)
+
+
+if __name__ == "__main__":
+    main()
