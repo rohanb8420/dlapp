@@ -1,0 +1,9 @@
+streamlit
+pandas
+scikit-learn
+openpyxl
+python-docx
+python-pptx
+PyPDF2
+tika
+joblib
