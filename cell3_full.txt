@@ -1,0 +1,216 @@
+def ensure_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
+    with con:
+        con.executescript(SCHEMA)
+    con.close()
+
+
+def sha1_of_file(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha1()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def stat_path(path_str: str) -> Dict[str, Any]:
+    path = Path(path_str)
+    info: Dict[str, Any] = {
+        "path": str(path),
+        "folder": str(path.parent),
+        "file_name": path.name,
+        "extension": path.suffix.lower().lstrip("."),
+        "mime_type": mimetypes.guess_type(str(path))[0] or "",
+        "size_bytes": None,
+        "created_ts": None,
+        "modified_ts": None,
+        "sha1": None,
+        "exists_flag": 0,
+        "read_error": None,
+    }
+    try:
+        st = path.stat()
+        info.update(
+            {
+                "size_bytes": int(st.st_size),
+                "created_ts": datetime.fromtimestamp(st.st_ctime).isoformat(),
+                "modified_ts": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                "sha1": sha1_of_file(path),
+                "exists_flag": 1,
+            }
+        )
+    except Exception as exc:
+        info["read_error"] = f"stat_error: {exc}"
+    return info
+
+
+def _read_txt(path: Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            return handle.read(MAX_TEXT)
+    except Exception:
+        return ""
+
+
+def _read_csv(path: Path) -> str:
+    try:
+        rows: List[str] = []
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                rows.append(", ".join(cell.strip() for cell in row if cell))
+                if len("\n".join(rows)) > MAX_TEXT:
+                    break
+        return "\n".join(rows)[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _read_pdf(path: Path) -> str:
+    if PdfReader is None:
+        return ""
+    try:
+        reader = PdfReader(str(path))
+        parts: List[str] = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if text:
+                parts.append(text)
+            if len("\n".join(parts)) > MAX_TEXT:
+                break
+        return "\n".join(parts)[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _read_docx(path: Path) -> str:
+    if DocxDocument is None:
+        return ""
+    try:
+        document = DocxDocument(str(path))
+        return "\n".join(p.text for p in document.paragraphs if p.text)[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _read_pptx(path: Path) -> str:
+    if PptxPresentation is None:
+        return ""
+    try:
+        presentation = PptxPresentation(str(path))
+        pieces: List[str] = []
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    pieces.append(shape.text)
+            if len("\n".join(pieces)) > MAX_TEXT:
+                break
+        return "\n".join(pieces)[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _read_xlsx(path: Path) -> str:
+    if openpyxl is None:
+        return ""
+    try:
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        lines: List[str] = []
+        for sheet in wb.worksheets:
+            for row in sheet.iter_rows(values_only=True):
+                vals = [str(cell) for cell in row if cell is not None]
+                if vals:
+                    lines.append(" ".join(vals))
+                if len("\n".join(lines)) > MAX_TEXT:
+                    break
+            if len("\n".join(lines)) > MAX_TEXT:
+                break
+        return "\n".join(lines)[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _read_twb(path: Path) -> str:
+    try:
+        tree = ET.parse(str(path))
+        root = tree.getroot()
+        texts: List[str] = []
+        for elem in root.iter():
+            if elem.text and elem.text.strip():
+                texts.append(elem.text.strip())
+            for attr in ("name", "caption", "label", "value"):
+                value = elem.attrib.get(attr)
+                if value:
+                    texts.append(value)
+            if len("\n".join(texts)) > MAX_TEXT:
+                break
+        return "\n".join(texts)[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _read_twbx(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(str(path)) as archive:
+            members = [m for m in archive.namelist() if m.endswith(".twb")]
+            if not members:
+                return ""
+            data = archive.read(members[0])
+            root = ET.fromstring(data)
+            texts: List[str] = []
+            for elem in root.iter():
+                if elem.text and elem.text.strip():
+                    texts.append(elem.text.strip())
+                for attr in ("name", "caption", "label", "value"):
+                    value = elem.attrib.get(attr)
+                    if value:
+                        texts.append(value)
+                if len("\n".join(texts)) > MAX_TEXT:
+                    break
+            return "\n".join(texts)[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _read_with_tika(path: Path) -> str:
+    if tika_parser is None:
+        return ""
+    try:
+        parsed = tika_parser.from_file(str(path))
+        return (parsed.get("content") or "")[:MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def extract_text(path: Path, extension: str) -> str:
+    ext = extension.lower()
+    if ext in {"txt", "log", "md"}:
+        return _read_txt(path)
+    if ext in {"csv"}:
+        return _read_csv(path)
+    if ext == "pdf":
+        text = _read_pdf(path)
+        return text or _read_with_tika(path)
+    if ext == "docx":
+        text = _read_docx(path)
+        return text or _read_with_tika(path)
+    if ext == "pptx":
+        text = _read_pptx(path)
+        return text or _read_with_tika(path)
+    if ext in {"xlsx", "xlsm"}:
+        text = _read_xlsx(path)
+        return text or _read_with_tika(path)
+    if ext == "twb":
+        return _read_twb(path)
+    if ext == "twbx":
+        return _read_twbx(path)
+    if ext in {"one", "ppt", "doc", "xls", "msg"}:
+        return _read_with_tika(path)
+    return _read_with_tika(path)
