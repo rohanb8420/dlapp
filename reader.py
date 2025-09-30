@@ -10,8 +10,10 @@ records.
 import argparse
 import csv
 import hashlib
+import io
 import logging
 import mimetypes
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -98,6 +100,8 @@ CREATE TABLE IF NOT EXISTS content(
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 CREATE INDEX IF NOT EXISTS idx_labels_file ON labels(file_id);
 """
+
+ASCII_RE = re.compile(rb"[\x20-\x7E]{4,}")
 
 
 def ensure_db(db_path: Path) -> None:
@@ -241,6 +245,22 @@ def _read_xlsx(path: Path) -> str:
         return ""
 
 
+def _text_from_dataframe(df: pd.DataFrame) -> str:
+    if df.empty:
+        return ""
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False)
+    return buffer.getvalue()[:MAX_TEXT]
+
+
+def _read_xls(path: Path) -> str:
+    try:
+        df = pd.read_excel(str(path), engine=None)
+    except Exception:
+        return ""
+    return _text_from_dataframe(df)
+
+
 def _read_twb(path: Path) -> str:
     try:
         tree = ET.parse(str(path))
@@ -284,6 +304,38 @@ def _read_twbx(path: Path) -> str:
         return ""
 
 
+def _read_sas_dataset(path: Path) -> str:
+    try:
+        df = pd.read_sas(str(path), encoding="utf-8", format="sas7bdat")
+    except ValueError:
+        # Fall back to pandas auto-detection for alternate SAS binary formats.
+        try:
+            df = pd.read_sas(str(path))
+        except Exception:
+            return ""
+    except Exception:
+        return ""
+
+    if isinstance(df, pd.DataFrame):
+        return _text_from_dataframe(df)
+    return ""
+
+
+def _read_dll(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            # Scan the first ~2MB for printable ASCII sequences to avoid huge payloads.
+            data = handle.read(min(2_000_000, MAX_TEXT * 4))
+    except Exception:
+        return ""
+
+    matches = ASCII_RE.findall(data)
+    if not matches:
+        return ""
+    text = "\n".join(chunk.decode("ascii", errors="ignore") for chunk in matches)
+    return text[:MAX_TEXT]
+
+
 def _read_with_tika(path: Path) -> str:
     if tika_parser is None:
         return ""
@@ -312,11 +364,21 @@ def extract_text(path: Path, extension: str) -> str:
     if ext in {"xlsx", "xlsm"}:
         text = _read_xlsx(path)
         return text or _read_with_tika(path)
+    if ext == "xls":
+        text = _read_xls(path)
+        return text or _read_with_tika(path)
     if ext == "twb":
         return _read_twb(path)
     if ext == "twbx":
         return _read_twbx(path)
-    if ext in {"one", "ppt", "doc", "xls", "msg"}:
+    if ext == "sas":
+        return _read_txt(path)
+    if ext in {"sas7bdat", "sasbdat"}:
+        text = _read_sas_dataset(path)
+        return text or _read_with_tika(path)
+    if ext == "dll":
+        return _read_dll(path)
+    if ext in {"one", "ppt", "doc", "msg"}:
         return _read_with_tika(path)
     return _read_with_tika(path)
 
