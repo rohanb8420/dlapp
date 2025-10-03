@@ -50,110 +50,6 @@ MAX_CLASSIFICATION_FILES = 120
 ASSETS_DIR = Path(__file__).with_name('assets')
 LIGHTHOUSE_ASSET = ASSETS_DIR / 'lighthouse.png'
 
-GLOBAL_STYLE = '''
-.app-shell {
-    position: relative;
-}
-.intro-overlay {
-    position: fixed;
-    inset: 0;
-    background: radial-gradient(circle at 50% 40%, rgba(255, 255, 255, 0.92) 0%, rgba(0, 124, 65, 0.2) 55%, rgba(4, 45, 38, 0.88) 100%);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-    gap: 18px;
-    z-index: 999;
-    animation: lighthouseFade 3.4s ease forwards;
-    pointer-events: none;
-}
-.intro-overlay::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: url(/assets/lighthouse.png) center/contain no-repeat;
-    opacity: 0.88;
-    filter: drop-shadow(0 32px 38px rgba(0, 0, 0, 0.35));
-}
-.intro-overlay__caption {
-    font-size: 1.25rem;
-    color: #ffffff;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    text-shadow: 0 8px 18px rgba(0, 0, 0, 0.45);
-    position: relative;
-}
-.intro-overlay--hidden {
-    display: none;
-}
-@keyframes lighthouseFade {
-    0% { opacity: 1; transform: scale(1); }
-    60% { opacity: 1; transform: scale(1.02); }
-    100% { opacity: 0; transform: scale(1.05); visibility: hidden; }
-}
-@keyframes beaconFloat {
-    from { transform: translateY(0px); }
-    to { transform: translateY(-16px); }
-}
-.tab-body {
-    margin-top: 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 24px;
-}
-.classification-card {
-    background-color: #f7fffb;
-    padding: 20px;
-    border-radius: 12px;
-    box-shadow: 0 6px 18px rgba(0, 124, 65, 0.08);
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-}
-.classification-controls {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    align-items: center;
-}
-.classification-controls input {
-    flex: 1 1 320px;
-    padding: 10px 14px;
-    border-radius: 12px;
-    border: 1px solid #c9ebdc;
-    background-color: #ffffff;
-    box-shadow: inset 0 2px 4px rgba(4, 45, 38, 0.05);
-    font-size: 15px;
-}
-.classification-feedback {
-    min-height: 24px;
-    font-weight: 500;
-}
-.status {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    border-radius: 999px;
-    background: rgba(0, 124, 65, 0.12);
-    color: #064a34;
-    font-size: 0.95rem;
-}
-.status--error {
-    background: rgba(220, 0, 78, 0.12);
-    color: #8a1035;
-}
-.status--success {
-    background: rgba(0, 124, 65, 0.18);
-    color: #053829;
-}
-.status--running {
-    background: rgba(0, 124, 65, 0.12);
-}
-.dash-table-container .dash-spreadsheet-container {
-    border-radius: 12px !important;
-}
-'''
 
 def build_intro_overlay() -> html.Div:
     '''Return an animated overlay if lighthouse asset is available.'''
@@ -393,7 +289,6 @@ def build_layout(db_path: Path) -> html.Div:
             'overflowX': 'hidden',
         },
         children=[
-            html.Style(GLOBAL_STYLE),
             build_intro_overlay(),
             html.Header(
                 style={
