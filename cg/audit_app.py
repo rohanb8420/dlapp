@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 from pathlib import Path
+import re
 from typing import List, Optional
 
 from dash import Dash, Input, Output, State, dash_table, dcc, html, no_update
@@ -42,7 +44,7 @@ def build_layout(db_path: Path) -> html.Div:
         className="app-shell",
         children=[
             dcc.Store(id="active-run-id"),
-            dcc.Interval(id="status-timer", interval=4000, n_intervals=0),
+            dcc.Interval(id="status-timer", interval=1000, n_intervals=0),
             html.Div(
                 className="hero",
                 children=[
@@ -197,17 +199,42 @@ def register_callbacks(app: Dash, job_manager: JobManager, db_path: Path) -> Non
     def handle_start(n_clicks: int, root_value: Optional[str]):
         if not root_value:
             raise PreventUpdate
+        app.logger.info("Start button clicked with value=%r", root_value)
         try:
-            job = job_manager.start(root_value)
+            root_path = _normalize_root_input(root_value)
+        except ValueError as exc:
+            app.logger.warning("Start aborted: %s", exc)
+            return (html.Span(str(exc), className="feedback feedback--error"), no_update)
+
+        if not root_path.exists():
+            app.logger.warning("Start aborted: path not found %s", root_path)
+            return (
+                html.Span(f"Path not found: {root_path}", className="feedback feedback--error"),
+                no_update,
+            )
+        if not root_path.is_dir():
+            app.logger.warning("Start aborted: not a directory %s", root_path)
+            return (
+                html.Span(f"Not a directory: {root_path}", className="feedback feedback--error"),
+                no_update,
+            )
+        try:
+            job = job_manager.start(str(root_path))
         except JobAlreadyRunningError as exc:
+            app.logger.info("Start rejected: %s", exc)
             return (html.Span(str(exc), className="feedback feedback--warn"), no_update)
         except Exception as exc:  # pragma: no cover - defensive
+            app.logger.exception("Unable to start scan for %s", root_path)
             return (
                 html.Span(f"Unable to start scan: {exc}", className="feedback feedback--error"),
                 no_update,
             )
+        app.logger.info("Queued run_id=%s for %s", job.run_id, job.root_path)
         return (
-            html.Span(f"Started scan for {job.root_path}", className="feedback feedback--ok"),
+            html.Span(
+                f"Scan queued (run {job.run_id}) for {Path(job.root_path)}",
+                className="feedback feedback--ok",
+            ),
             job.run_id,
         )
 
@@ -233,11 +260,18 @@ def register_callbacks(app: Dash, job_manager: JobManager, db_path: Path) -> Non
         Output("status-panel", "children"),
         Output("run-dropdown", "options"),
         Input("status-timer", "n_intervals"),
+        Input("start-button", "n_clicks"),
         State("active-run-id", "data"),
     )
-    def refresh_status(_: int, active_run_id: Optional[int]):
+    def refresh_status(_: int, __: Optional[int], active_run_id: Optional[int]):
         job_status = job_manager.get_status()
         runs = audit_db.list_runs(db_path)
+        app.logger.debug(
+            "refresh_status active_run=%s job_status=%s runs=%s",
+            active_run_id,
+            job_status.status if job_status else None,
+            len(runs),
+        )
         options = [
             {
                 "label": _format_run_option(run),
@@ -247,7 +281,7 @@ def register_callbacks(app: Dash, job_manager: JobManager, db_path: Path) -> Non
         ]
 
         status_children: List[html.Div] = []
-        if job_status and job_status.status in {"queued", "running"}:
+        if job_status:
             status_children.append(_build_job_status(job_status))
         if active_run_id:
             run_summary = next((run for run in runs if run["run_id"] == active_run_id), None)
@@ -312,6 +346,13 @@ def register_callbacks(app: Dash, job_manager: JobManager, db_path: Path) -> Non
         page_count = max(math.ceil(total / page_size), 1) if total else 0
         return rows, page_count, total_display
 
+    @app.callback(
+        Output("start-button", "disabled"),
+        Input("status-timer", "n_intervals"),
+    )
+    def toggle_start_disabled(_: int) -> bool:
+        return job_manager.has_active_job()
+
 
 def _format_run_option(run: dict) -> str:
     root = Path(run["root_path"])
@@ -324,9 +365,16 @@ def _build_job_status(job_status) -> html.Div:
     message = job_status.message
     processed = f"{job_status.processed_files:,}"
     current = job_status.current_path or ""
-    status_class = (
-        "status-card status-card--running" if job_status.status == "running" else "status-card"
-    )
+    status = (job_status.status or "").lower()
+    status_class = "status-card"
+    if status == "running":
+        status_class += " status-card--running"
+    elif status == "completed":
+        status_class += " status-card--ok"
+    elif status == "failed":
+        status_class += " status-card--error"
+    elif status == "queued":
+        status_class += " status-card--queued"
     return html.Div(
         className=status_class,
         children=[
@@ -361,6 +409,22 @@ def _build_run_summary(run: dict) -> html.Div:
     )
 
 
+_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:$")
+
+
+def _normalize_root_input(raw_value: str) -> Path:
+    cleaned = raw_value.strip().strip('"').strip()
+    if not cleaned:
+        raise ValueError("Folder path cannot be empty.")
+    # Handle drive-letter inputs like "C:" by normalizing to "C:\"
+    if _DRIVE_PATTERN.match(cleaned):
+        cleaned += "\\"
+    # Translate UNC paths that might use forward slashes in user input
+    if cleaned.startswith("//"):
+        cleaned = "\\" + cleaned.lstrip("/")
+    return Path(cleaned).expanduser().resolve(strict=False)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Content Governance audit dashboard.")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path.")
@@ -372,8 +436,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
     app = create_app(args.db)
-    app.run_server(host=args.host, port=args.port, debug=args.debug)
+    app.logger.setLevel(logging.INFO)
+    run_callable = getattr(app, "run", None)
+    if callable(run_callable):
+        run_callable(host=args.host, port=args.port, debug=args.debug)
+    else:  # Dash < 3.0 fallback
+        app.run_server(host=args.host, port=args.port, debug=args.debug)
 
 
 if __name__ == "__main__":

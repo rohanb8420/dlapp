@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
+import logging
+
 from . import DEFAULT_DB_PATH
 from . import audit_db
 from .audit_indexer import IndexResult, IndexStats, index_path
@@ -41,6 +43,9 @@ class JobAlreadyRunningError(RuntimeError):
     """Raised when a new job is requested while another is running."""
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 class JobManager:
     """Simple single-worker manager used by the Dash app."""
 
@@ -49,6 +54,8 @@ class JobManager:
         self._lock = threading.Lock()
         self._job: Optional[JobStatus] = None
         self._thread: Optional[threading.Thread] = None
+        audit_db.ensure_database(self.db_path)
+        LOGGER.debug("JobManager initialized with DB at %s", self.db_path)
 
     def start(self, root_path: str) -> JobStatus:
         """Queue a new crawl job."""
@@ -62,11 +69,12 @@ class JobManager:
                 run_id=run_id,
                 root_path=str(root.resolve()),
                 status="queued",
-                message="Queued",
+                message="Queued (preparing to index)",
             )
             self._job = job
             self._thread = threading.Thread(target=self._worker, args=(job,), daemon=True)
             self._thread.start()
+            LOGGER.info("Started crawl job %s for %s (run_id=%s)", job.job_id, job.root_path, run_id)
             return job
 
     def get_status(self) -> Optional[JobStatus]:
@@ -85,6 +93,7 @@ class JobManager:
             job.status = "running"
             job.message = "Indexing…"
             job.started_at = time.time()
+        LOGGER.info("Job %s running against %s", job.job_id, job.root_path)
 
         try:
             result = index_path(
@@ -94,7 +103,15 @@ class JobManager:
                 progress_callback=self._on_progress,
             )
             self._on_complete(job, result, status="completed", message="Scan complete.")
+            LOGGER.info(
+                "Job %s completed: files=%s errors=%s duration=%.2fs",
+                job.job_id,
+                result.total_files,
+                result.error_count,
+                result.duration_seconds,
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.exception("Job %s failed", job.job_id)
             self._on_complete(
                 job,
                 IndexResult(
@@ -119,6 +136,13 @@ class JobManager:
                 if stats.processed_files
                 else "Indexing…"
             )
+        LOGGER.debug(
+            "Job %s progress: files=%s errors=%s last=%s",
+            self._job.job_id if self._job else "n/a",
+            stats.processed_files,
+            stats.error_count,
+            stats.current_path,
+        )
 
     def _on_complete(
         self,
@@ -138,6 +162,14 @@ class JobManager:
                 finished - (job.started_at or finished)
             )
             self._thread = None
+        LOGGER.info(
+            "Job %s final state=%s files=%s errors=%s duration=%.2fs",
+            job.job_id,
+            status,
+            result.total_files,
+            result.error_count,
+            job.duration_seconds or 0.0,
+        )
 
 
 manager = JobManager()

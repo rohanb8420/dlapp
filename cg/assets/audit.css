@@ -159,6 +159,19 @@ body {
   border: 2px solid rgba(0, 168, 107, 0.35);
 }
 
+.status-card--queued {
+  border: 2px dashed rgba(0, 124, 65, 0.35);
+}
+
+.status-card--ok {
+  border: 2px solid rgba(0, 168, 107, 0.28);
+}
+
+.status-card--error {
+  border: 2px solid rgba(186, 26, 26, 0.35);
+  background: rgba(255, 246, 246, 0.96);
+}
+
 .status-card h3 {
   margin-top: 0;
   margin-bottom: 8px;

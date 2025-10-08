@@ -66,7 +66,7 @@ def index_path(
     run_id: int,
     db_path: Optional[Path] = None,
     progress_callback: Optional[Callable[[IndexStats], None]] = None,
-    batch_size: int = 500,
+    batch_size: int = 200,
 ) -> IndexResult:
     """Crawl `root_path` recursively and persist file metadata."""
     root = Path(root_path).resolve()
@@ -85,8 +85,28 @@ def index_path(
     try:
         audit_db.mark_run_started(run_id, connection=connection)
         batch: List[Tuple[str, str, str, str, Optional[str], Optional[str], Optional[str]]] = []
+        if progress_callback:
+            progress_callback(
+                IndexStats(
+                    processed_files=0,
+                    error_count=0,
+                    current_path=str(root),
+                )
+            )
 
-        for current_root, _, files in os.walk(root, followlinks=False):
+        def handle_walk_error(exc: OSError) -> None:
+            nonlocal error_count
+            error_count += 1
+            if progress_callback:
+                progress_callback(
+                    IndexStats(
+                        processed_files=total_files,
+                        error_count=error_count,
+                        current_path=getattr(exc, "filename", None),
+                    )
+                )
+
+        for current_root, _, files in os.walk(root, followlinks=False, onerror=handle_walk_error):
             current_dir = Path(current_root)
             for name in files:
                 file_path = current_dir / name
