@@ -7,3 +7,4 @@ python-pptx
 PyPDF2
 tika
 joblib
+dash

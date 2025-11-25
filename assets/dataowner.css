@@ -1,0 +1,121 @@
+.app-shell {
+    min-height: 100vh;
+    font-family: "Segoe UI", "Inter", system-ui, -apple-system, sans-serif;
+    padding: 28px 32px 48px;
+    transition: background 0.3s ease, color 0.3s ease;
+}
+
+.theme-light {
+    --bg: #f4fbf7;
+    --panel: #ffffff;
+    --text: #0b3d2e;
+    --muted: #5c7c6b;
+    --primary: #007c41;
+    --accent: #00a86b;
+    --warning: #f0a202;
+    --danger: #d52b1e;
+    --success: #0b6b3a;
+    --shadow: 0 14px 30px rgba(0, 124, 65, 0.14);
+    --soft-danger: #ffebee;
+    --soft-warning: #fff7e0;
+    --soft-success: #e3f2ed;
+    background: var(--bg);
+    color: var(--text);
+}
+
+.theme-dark {
+    --bg: #071c17;
+    --panel: #0f2b23;
+    --text: #e7f4ee;
+    --muted: #9bbcaf;
+    --primary: #43d487;
+    --accent: #7efcb4;
+    --warning: #f7c266;
+    --danger: #ff7b7b;
+    --success: #58f0a0;
+    --shadow: 0 18px 38px rgba(0, 0, 0, 0.45);
+    --soft-danger: #2a1217;
+    --soft-warning: #2c2110;
+    --soft-success: #10271f;
+    background: var(--bg);
+    color: var(--text);
+}
+
+.panel {
+    background: var(--panel);
+    border-radius: 16px;
+    padding: 18px 20px;
+    box-shadow: var(--shadow);
+}
+
+.metric-grid {
+    display: grid;
+    gap: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+.metric-card {
+    background: var(--panel);
+    border-radius: 14px;
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.02);
+}
+
+.metric-label {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+
+.metric-value {
+    font-size: 1.9rem;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.02em;
+}
+
+.metric-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+
+.filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+}
+
+.filters input {
+    min-width: 220px;
+    padding: 10px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    background: var(--panel);
+    color: var(--text);
+}
+
+.tab-body {
+    margin-top: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+.status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.9rem;
+}
